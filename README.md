@@ -34,3 +34,4 @@ DISCLAIMER:
 Python is not my native language but I tried to minimize queries and take advantage of Python data structures to make the process more agile.
 The results are fit for my actual purposes, but the tool wasn’t thoroughly tested. Use it at your own risk.
 Also, I am unaware of any variability on the Google Drive FS artifacts.
+I was inspired by https://github.com/net-protect/google-fs-recover.
