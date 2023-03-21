@@ -1,0 +1,203 @@
+import os
+import sqlite3
+import sys
+import csv
+import shutil
+import argparse
+import blackboxprotobuf
+from datetime import datetime
+import time
+
+def GetArgs(_args):#Get cmdline opts
+	allArgs = argparse.ArgumentParser()
+	
+	allArgs.add_argument("-p","--profile", required=True, help="Path to GoogleFS profile.")
+	allArgs.add_argument("-c","--csv", required=True, help="Path to the destination csv file.")
+	allArgs.add_argument("-r","--recovery_dir", required=False, help="Recover cached files with full path under dir provider.")
+	allArgs.add_argument("-d","--devices", required=False, action='store_true', help="Get and present information on the devices used.")
+	return vars(allArgs.parse_args())
+
+def GetUserInfo(metadata_cur):
+
+	#User information from the metadata DB
+	print("User info")
+	print("=========")
+	for data in metadata_cur.execute("SELECT value FROM properties WHERE property = 'account'"):
+		message, _ = blackboxprotobuf.decode_message(data[0])
+		print("Name: " + message["1"]["3"].decode('utf-8'))
+		print("User: " + message["1"]["8"].decode('utf-8'))
+		profile = message["1"]["2"].decode('utf-8')
+		print("Profile: " + profile + "\n")
+	return profile
+
+def GetDevices(googlePath):
+
+	# Connect to the root_preference DB
+	devicesDb = os.path.dirname(os.path.dirname(googlePath))
+	devicesDb = os.path.join(devicesDb, "root_preference_sqlite.db")
+	if not (os.path.exists(devicesDb)): #Check if sqllite db exists
+		raise Exception(f"Unexisting root_preference database at {devicesDb}")
+
+	devices_conn = sqlite3.connect(devicesDb)
+	devices_cur = devices_conn.cursor()
+
+	print("Connected devices")
+	print("=================")
+	for data in devices_cur.execute("SELECT name, media_id, last_mount_point FROM media"):
+		print("Name: " + data[0])
+		print("Id: " + data[1])
+		print("Last mounted at: " + data[2] + "\n")
+
+def RecoverFiles(metadata_cur, sqlFileData, fullPaths, cacheDir, recoveryPath):
+	#Get the cached file names decoding field "item_properties" by "stable_id"
+	cachedFiles = {}
+	for data in metadata_cur.execute("SELECT item_stable_id, value from item_properties where key = 'content-entry'"):
+		message, typedefs = blackboxprotobuf.decode_message(data[1])
+		if "1" in message.keys():
+			cachedFiles[str(message["1"])] = data[0]
+
+	#Recover cached files with full path
+	
+	#Counters
+	error = 0
+	count_ok = 0
+	count_orphan = 0
+	
+	#Path for files without proper recovery folder
+	orphanPath = f"{os.path.join(recoveryPath, 'orphan')}"
+	
+	#For every file under cacheDir
+	for root, dirs, file in os.walk(cacheDir):
+		for cacheFile in file:
+			Copied = False
+			#Not the chunks DB
+			if (cacheFile != "chunks.db"):
+				#If the name of the file in the cacheDir is in the metadata DB...
+				if (cacheFile in cachedFiles.keys()):
+					cacheFilePath = os.path.join(root,cacheFile)
+					name = sqlFileData[cachedFiles[cacheFile]]["localName"]
+					#If there is an entry for the file in the recovered list of full paths...
+					if (name in fullPaths.keys()):	
+						Copied = True
+						pathFile = fullPaths[name]
+						destinationFile = f"{os.path.join(recoveryPath, pathFile)}"
+						version = 1
+						while (os.path.isfile(destinationFile)):
+							new_name = os.path.splitext(pathFile)[0] + "_GDFS_v_" + str(version) + os.path.splitext(pathFile)[1]
+							destinationFile = f"{os.path.join(recoveryPath, new_name)}"
+							version += 1
+						dirname = os.path.dirname(destinationFile)
+						os.makedirs(dirname, exist_ok=True)
+						try:
+							shutil.copyfile(cacheFilePath, destinationFile)
+							count_ok += 1
+						except Error as err:
+							print ("Error in copy operation: " + err)
+							error += 1
+				#If not copied (not in list of cached files or not in list of full paths)
+				#Copy to the orphan folder
+				if (not Copied):
+					cacheFilePath = os.path.join(root,cacheFile)
+					if (not os.path.exists(orphanPath)):
+						os.makedirs(orphanPath)
+					destinationFile = f"{os.path.join(orphanPath, cacheFile)}"
+					try:
+						shutil.copyfile(cacheFilePath, destinationFile)
+						count_ok += 1
+						count_orphan += 1
+					except Error as err:
+						print ("Error in copy operation: " + err)
+						error += 1
+						
+	print("File recovery")
+	print("=============")	
+	print(f"{count_ok} files copied to recovery folder, {count_orphan} of them orphan, {error} copied with errors.\n")
+
+def main(_args):
+	#Get the arguments
+	args = GetArgs(_args)
+
+	#Get the path to the profile
+	googlePath = args["profile"] #Get path of GoogleFS profile
+
+	#Get paths...
+	# to metadata db
+	metadataDb = os.path.join(googlePath, "metadata_sqlite_db")
+	# to content cache
+	cacheDir = os.path.join(googlePath, "content_cache")
+	# to recovery dir
+	recoveryPath = args["recovery_dir"]
+	# to csv
+	csvPath = args["csv"]
+
+	# Connect to the metadata DB
+	if not (os.path.exists(	metadataDb)): #Check if sqllite db exists
+		raise Exception(f"Unexisting metadata database at {metadataDb}")
+
+	metadata_conn = sqlite3.connect(metadataDb)
+	metadata_cur = metadata_conn.cursor()
+
+	#Get the googleId
+	googleId = GetUserInfo(metadata_cur)
+	
+	##If devices...
+	if(args["devices"]):
+		GetDevices(googlePath)
+
+	##Get SQL File Names
+	sqlFileData = {}
+
+	#Load all file data indexed by stable_id
+	for data in metadata_cur.execute("SELECT stable_id, local_title, viewed_by_me_date, is_folder FROM items"):		
+		sqlFileData[data[0]] = {"localName": data[1], "viewed_by_me_Date": data[2], "isFolder": data[3]}
+
+	##Get SQL Parents
+	sqlParentData = {}
+
+	#Load all folder hierarchy (stable_id -> parent_stable_id) indexed by stable_id
+	for data in metadata_cur.execute("SELECT item_stable_id, parent_stable_id FROM stable_parents"):
+		sqlParentData[data[0]] = data[1]
+	
+	#Get full paths
+	count = 0
+	headers = ['fullPath','viewed_by_me_Date']
+	timestamp = datetime.now()
+	unixtime = time.mktime(timestamp.timetuple())
+	unixtime = f"{unixtime}"
+	unixtime = unixtime.split(".")
+	unixtime = unixtime[0]
+	formatedTimeStamp = timestamp.strftime("%Y%m%d%H%M%S")
+	csvFileName = f'driveFS-fullPath_viewDate-{googleId}_{formatedTimeStamp}.csv'
+	
+	with open(f"{os.path.join(csvPath,csvFileName)}", 'w', encoding='UTF8', newline='') as csvFile:
+		allData = []
+		writer = csv.writer(csvFile, quoting=csv.QUOTE_NONNUMERIC)
+		writer.writerow(headers)
+
+		fullPaths = {}
+		for id in sqlFileData.keys():
+			path = sqlFileData[id]["localName"]
+			view_date = str(sqlFileData[id]["viewed_by_me_Date"])
+
+			if ((id in sqlParentData) & (id != 101)):
+				parent = sqlParentData[id]
+				while (parent in sqlParentData):
+					path = sqlFileData[parent]["localName"] + "/" + path
+					parent = sqlParentData[parent]
+				path = sqlFileData[101]["localName"] + "/" + path
+			if (not sqlFileData[id]["isFolder"]):
+				fullPaths[sqlFileData[id]["localName"]] = path
+			writer.writerow([path, int(view_date)])
+			count += 1
+		print("\nWrite to CSV")
+		print("============")
+		print(f"{count} rows written to {csvFileName}.\n")
+
+	#If recovery...
+	if(recoveryPath != None):
+		RecoverFiles(metadata_cur, sqlFileData, fullPaths, cacheDir, recoveryPath)
+
+	
+if __name__ == "__main__":
+	argv = sys.argv[1:]
+	main(argv)
