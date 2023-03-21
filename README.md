@@ -17,6 +17,9 @@ From the metadata DB we can get all the information needed to list the content h
 The app caches files in a two level folder structure under "content_cache", in the profile directory.
 The stored files have a 6 digits name and reside in a two levels folder structure of nodes named "dXXX".
 
+I found that there can be cached files pointing to the same file. In these cases the tool generates a version named "filename__GDFS_v_XX.extension".
+If a corresponding path is not found in the metadata DB, the file is copied to an "orphan" folder under the recovery directory.
+
 Usage
 =====
 
